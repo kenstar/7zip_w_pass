@@ -1,0 +1,194 @@
+(*
+7zip_w_password
+
+ファイルのドロップ＆ドロップで、パスワード付きのzipを生成。
+圧縮ソフトは7zipを使用する。
+ (日本語ファイル名のサポートは7zipに依存。)
+7zipは、以下のURLからファイルをダウンロードしてコンパイル、インストール。
+(7zipのインストール先は/usr/local/bin/に決め打ち。TerminalとAppleScriptのenvが異なるために、パスは異なっているらしい)
+http://www.7-zip.org/download.html
+
+seuzoさんのコードを有効活用させていただいた。
+
+*)
+
+property debug : "Yes"
+
+on run
+	repeat
+		display dialog "デバッグモードを変更しますか？" & return & return & "Debug mode: " & (debug as text) buttons {"Change", "Done"} default button 2 with title "Debug mode setting."
+		if the button returned of the result is "Change" then
+			display dialog "デバッグモードにしますか?" & return & return & "Current Status: " & (debug as text) buttons {"No", "Yes"} default button debug
+			if the button returned of the result is "Yes" then
+				set debug to "Yes"
+			else
+				set debug to "No"
+			end if
+		else
+			return "done"
+		end if
+	end repeat
+end run
+
+
+--パスワードを自動生成。ただし、このコードでは使用しない
+to generate_password(n)
+	set pass to ""
+	set str to "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	repeat n times
+		set pass to pass & (some character of str)
+	end repeat
+	return pass
+end generate_password
+
+
+--パスワードを得る
+to get_password()
+	--	set my_password to (text returned of (display dialog "Input Zip Password" & return & "（空白にすれば、パスワードを自動生成します）" & return & "終了後、パスワードはクリップボードに保存されます" default answer "" default button 2 with hidden answer))
+	set my_password to (text returned of (display dialog "Input Zip Password" & return & "（空白にすれば、パスワードを設定しません。）" default answer "" default button 2 with hidden answer))
+	
+	if (my_password is "") then
+		-- パスワードを生成せず、パスワード設定をしない選択肢とする
+		--		set my_password to my generate_password(10)
+	else
+		set password_test to do shell script "echo " & my_password & " | perl -pe 's/[0-9A-Za-z]+//;'"
+		if (password_test is not "") then
+			display dialog "パスワードに半角英数字以外の文字が使われています。" buttons {"Cancel"} default button 1 with icon 1 --キャンセルで終了
+		end if
+	end if
+	return my_password
+end get_password
+
+
+--同名ファイルの警告
+to alert_same_name(file_path)
+	tell application "Finder"
+		if (exists (file_path as POSIX file)) then
+			display dialog file_path & " は同名のファイルがあります" & return & "処理を続けますか？" buttons {"Cancel", "続行"} default button 1 with icon 1 --キャンセルで終了
+		end if
+	end tell
+end alert_same_name
+
+
+--ファイル名の警告、7zipでは対応している前提で、このロジックは使用しない
+to violation_name(file_path)
+	set file_path to quoted form of ((POSIX path of file_path) as Unicode text) --まずPOSIX pathにする
+	set file_path_test to do shell script "echo " & file_path & " | perl -pe 's/[\\/\\.0-9A-Za-z _-]+//;'"
+	if (file_path_test is not "") then
+		display dialog file_path & " のファイル名には英数字以外の文字が使われています。" & return & "圧縮・送信・伸長時にトラブルになるかもしれません。続行しますか？" buttons {"Cancel", "続行"} default button 1 with icon 1 --キャンセルで終了
+	end if
+end violation_name
+
+
+--フルパス名を、コンテナディレクトリ・ファイル名+拡張子・ファイル名・拡張子に分割する
+--返値はPOSIX pathのレコード　{dir:"", name_ext:"", f_name:"", ext:""}
+to split_path(f)
+	set f to quoted form of ((POSIX path of f) as Unicode text) --まずPOSIX pathにする
+	set d to do shell script "echo " & f & " | perl -pe 's/^(.+\\/).+$/$1/;'" --コンテナディレクトリ
+	set ne to do shell script "echo " & f & " | perl -pe 's/^.+\\/(.)/$1/;'" --ファイル名+拡張子
+	if f ends with "/'" then --フォルダの場合
+		set n to text 1 thru -2 of ne
+		set e to ""
+	else
+		set e to do shell script "echo '" & ne & "' | perl -pe 's/^.+(\\..+)$/$1/;'"
+		if e is not "" then
+			set n to do shell script "echo '" & ne & "' | perl -pe 's/" & e & "$//;'"
+		end if
+	end if
+	
+	return {dir:d, name_ext:ne, f_name:n, ext:e}
+end split_path
+
+--リストの結合
+to as_join(thedelimit, theList)
+	set oldDelim to AppleScript's text item delimiters
+	set AppleScript's text item delimiters to thedelimit
+	set tmpstr to theList as text
+	set AppleScript's text item delimiters to oldDelim
+	return tmpstr
+end as_join
+
+
+--ドラッグ＆ドロップで実行
+on open of my_files
+	
+	set my_password to my get_password()
+	
+	-- パスワード用のコマンドライン
+	if (my_password is equal to "") then
+		-- パスワード設定をしないパターン
+		set password_commandline to ""
+	else
+		-- パスワード設定をする
+		set password_commandline to "-p" & my_password & " "
+	end if
+	
+	
+	
+	set file_path_org to {} --圧縮するファイルのリスト スペース区切りで追加していく
+	
+	set today_str to do shell script "date +%Y-%m-%d" --本日の日付
+	set zip_file_full_path to choose file name with prompt "保存先：" default name today_str & ".zip" --同名ファイルを作ろうとするとここで怒られる
+	
+	set zip_file_info to my split_path(zip_file_full_path) --ファイルパスの分割
+	set zip_file_name to quoted form of (name_ext of zip_file_info) --zipファイルの名前
+	set zip_file_dir to dir of zip_file_info --zipの格納パス
+	
+	if 1 < (length of my_files) then --2つ以上のファイルがドラッグ＆ドロップされた
+		--ターゲットファイル
+		set commandline to ""
+		repeat with i in my_files
+			set aFile to (POSIX path of (i as alias))
+			set tmp_info to split_path(aFile) --ファイルパスの分割
+			set tmp_dir to quoted form of (dir of tmp_info)
+			set tmp_name to quoted form of (name_ext of tmp_info)
+			
+			
+			
+			set commandline to commandline & "cd " & tmp_dir & "; /usr/local/bin/7za a " & password_commandline & " -xr\\!*.DS_Store -xr\\!*__MACOSX/ " & zip_file_dir & zip_file_name & " " & tmp_name & ";"
+			
+			if debug is "Yes" then
+				display dialog commandline
+			end if
+			
+			(*
+			if (dir of tmp_path) is zip_file_dir then --zipアーカイブと同じディレクトリなら
+				set end of file_path_org to quoted form of (name_ext of tmp_path) --ファイル名だけ
+			else
+				set end of file_path_org to quoted form of aFile --ちがうならフルパスで
+			end if
+*)
+		end repeat
+		
+		(*
+		set file_path_org to my as_join(" ", file_path_org)
+		set commandline to "cd " & zip_file_dir & "; /usr/local/bin/7za a " & password_commandline & " -xr\\!*.DS_Store -xr\\!*__MACOSX/ " & zip_file_name & " " & file_path_org
+		*)
+		
+	else --処理ファイルはひとつだけ
+		set aFile to (POSIX path of ((item 1 of my_files) as alias))
+		set file_info to my split_path(aFile) --ファイルパスの分割
+		my alert_same_name(dir of file_info & f_name of file_info & ".zip") --同名ファイルの警告
+		--		set file_path_zip to quoted form of (f_name of file_path & ".zip") --.zip拡張子
+		set file_path_org to quoted form of name_ext of file_info --同じディレクトリに展開するので、ファイル名のみ
+		
+		set commandline to "cd " & dir of file_info & "; /usr/local/bin/7za a " & password_commandline & " -xr\\!*.DS_Store -xr\\!*__MACOSX/ " & zip_file_dir & zip_file_name & " " & file_path_org
+		
+	end if
+	
+	try
+		if debug is "Yes" then
+			display dialog commandline
+		end if
+		
+		set add_files to do shell script commandline
+		
+		if debug is "Yes" then
+			display dialog add_files
+		end if
+	on error errMsg number errNo
+		display dialog "7zip実行エラーです" & return & errMsg & return & errNo buttons {"Cancel"} default button 1 with icon 1 --キャンセルで終了
+	end try
+	--set the clipboard to my_password --クリップボードにパスワードを保存
+	
+end open
